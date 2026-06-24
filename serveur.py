@@ -1,16 +1,14 @@
 """
-- Kasongo Mashika Samuel Evariste
-- Papa Mbaye Diop
-- Sokhna Sylla
-- Hountondji Geoffroy
-- Mouhamadou Moustapha Ndiaye
+serveur.py — Serveur TCP du Kiosk à produits
+Adapté pour Railway : PORT lu depuis la variable d'environnement
 """
 
 import socket
 import threading
 import json
 import time
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 
 from models import init_db, Commande, db
 from auth import (inscrire_client, connecter_client,
@@ -21,11 +19,11 @@ from boutique import (afficher_catalogue, passer_commande,
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-HOST          = "0.0.0.0"
-PORT          = 5555
-MAX_CLIENTS   = 20
-BUFFER_SIZE   = 4096
-DELAI_ANNUL   = 300   # 5 minutes en secondes
+HOST        = "0.0.0.0"
+PORT        = int(os.environ.get("PORT", 5555))  # Railway injecte PORT auto
+MAX_CLIENTS = 20
+BUFFER_SIZE = 4096
+DELAI_ANNUL = 300  # 5 minutes
 
 # ── Compteur de connexions ────────────────────────────────────────────────────
 
@@ -45,7 +43,6 @@ Connectez-vous ou créez un compte pour commencer.
 # ── Protocole JSON ────────────────────────────────────────────────────────────
 
 def envoyer(conn: socket.socket, data: dict):
-    """Sérialise et envoie un dict JSON suivi d'un newline."""
     try:
         message = json.dumps(data, ensure_ascii=False) + "\n"
         conn.sendall(message.encode("utf-8"))
@@ -54,10 +51,6 @@ def envoyer(conn: socket.socket, data: dict):
 
 
 def recevoir(conn: socket.socket) -> dict | None:
-    """
-    Reçoit un message JSON ligne par ligne.
-    Retourne None si la connexion est fermée ou le JSON invalide.
-    """
     try:
         data = b""
         while not data.endswith(b"\n"):
@@ -70,13 +63,9 @@ def recevoir(conn: socket.socket) -> dict | None:
         return None
 
 
-# ── Timer d'annulation (5 min) ────────────────────────────────────────────────
+# ── Timer d'annulation ────────────────────────────────────────────────────────
 
 def lancer_timer_validation(commande_id: int):
-    """
-    Lance un thread qui attend 5 minutes puis valide la commande
-    si elle est encore en statut 'en_attente'.
-    """
     def _valider():
         time.sleep(DELAI_ANNUL)
         valider_commande(commande_id)
@@ -89,13 +78,8 @@ def lancer_timer_validation(commande_id: int):
 # ── Dispatch des actions ──────────────────────────────────────────────────────
 
 def traiter_action(action: str, données: dict) -> dict:
-    """
-    Aiguille chaque action vers la bonne fonction métier.
-    Toutes les actions sauf INSCRIPTION et CONNEXION nécessitent un token.
-    """
     token = données.get("token", "")
 
-    # ── Sans authentification ────────────────────────────────────────────────
     if action == "INSCRIPTION":
         return inscrire_client(
             données.get("identifiant", ""),
@@ -103,67 +87,49 @@ def traiter_action(action: str, données: dict) -> dict:
             données.get("prenom", ""),
             données.get("mot_de_passe", ""),
         )
-
     if action == "CONNEXION":
         return connecter_client(
             données.get("identifiant", ""),
             données.get("mot_de_passe", ""),
         )
-
-    # ── Avec authentification (token requis) ─────────────────────────────────
     if action == "DECONNEXION":
         return deconnecter_client(token)
-
     if action == "PROFIL":
         return consulter_profil(token)
-
     if action == "MODIFIER_MDP":
         return modifier_mot_de_passe(
             token,
             données.get("ancien_mdp", ""),
             données.get("nouveau_mdp", ""),
         )
-
     if action == "SUPPRIMER_PROFIL":
         return supprimer_profil(token, données.get("mot_de_passe", ""))
-
     if action == "CATALOGUE":
         return afficher_catalogue(token)
-
     if action == "COMMANDER":
-        articles = données.get("articles", [])
-        resultat = passer_commande(token, articles)
-        # Lancer le timer si la commande a réussi
+        resultat = passer_commande(token, données.get("articles", []))
         if resultat.get("statut") == "OK":
             lancer_timer_validation(resultat["commande_id"])
         return resultat
-
     if action == "ANNULER":
         return annuler_commande(token, données.get("commande_id"))
 
-    return {"statut": "ERREUR",
-            "message": f"ERREUR: Action inconnue '{action}'."}
+    return {"statut": "ERREUR", "message": f"Action inconnue '{action}'."}
 
 
 # ── Gestion d'un client ───────────────────────────────────────────────────────
 
 def gerer_client(conn: socket.socket, adresse: tuple):
-    """
-    Thread dédié à un client connecté.
-    Boucle de réception → dispatch → réponse jusqu'à déconnexion.
-    """
     global connexions_actives
 
     ip, port = adresse
-    db.connect(reuse_if_open=True)   # connexion SQLite par thread (Windows)
-    print(f"[+] Nouveau client : {ip}:{port}  "
-          f"(actifs: {connexions_actives})")
+    db.connect(reuse_if_open=True)
+    print(f"[+] Nouveau client : {ip}:{port} (actifs: {connexions_actives})")
 
-    # Message de bienvenue + catalogue d'actions
     envoyer(conn, {
-        "statut":   "BIENVENUE",
-        "message":  BIENVENUE,
-        "actions":  [
+        "statut":  "BIENVENUE",
+        "message": BIENVENUE,
+        "actions": [
             "INSCRIPTION", "CONNEXION", "DECONNEXION",
             "PROFIL", "MODIFIER_MDP", "SUPPRIMER_PROFIL",
             "CATALOGUE", "COMMANDER", "ANNULER",
@@ -173,26 +139,22 @@ def gerer_client(conn: socket.socket, adresse: tuple):
     try:
         while True:
             requete = recevoir(conn)
-
-            # Connexion fermée côté client
             if requete is None:
                 print(f"[-] Déconnexion : {ip}:{port}")
                 break
 
             action  = requete.get("action", "").upper()
             données = requete.get("données", {})
-
             print(f"[>] {ip}:{port}  action={action}")
 
             try:
                 réponse = traiter_action(action, données)
             except Exception as e:
-                print(f"[!] Erreur traitement {action} : {e}")
-                réponse = {"statut": "ERREUR",
-                           "message": f"ERREUR serveur interne : {e}"}
+                print(f"[!] Erreur {action} : {e}")
+                réponse = {"statut": "ERREUR", "message": f"Erreur serveur : {e}"}
+
             envoyer(conn, réponse)
 
-            # Fermer proprement après déconnexion volontaire
             if action == "DECONNEXION" and réponse.get("statut") == "OK":
                 break
 
@@ -201,18 +163,16 @@ def gerer_client(conn: socket.socket, adresse: tuple):
     finally:
         conn.close()
         if not db.is_closed():
-            db.close()             # libérer la connexion SQLite du thread
+            db.close()
         with verrou_connexions:
             connexions_actives -= 1
-        print(f"[=] {ip}:{port} déconnecté  "
-              f"(actifs: {connexions_actives})")
+        print(f"[=] {ip}:{port} déconnecté (actifs: {connexions_actives})")
 
 
-# ── Boucle principale du serveur ──────────────────────────────────────────────
+# ── Boucle principale ─────────────────────────────────────────────────────────
 
 def demarrer_serveur():
-    """Initialise la DB et démarre l'écoute TCP."""
-    print("[DB] Initialisation de la base de données…")
+    print("[DB] Initialisation...")
     init_db()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -220,9 +180,7 @@ def demarrer_serveur():
     srv.bind((HOST, PORT))
     srv.listen(MAX_CLIENTS)
 
-    print(f"[OK] Serveur démarré sur {HOST}:{PORT} "
-          f"(max {MAX_CLIENTS} clients)")
-    print("     Appuyez sur Ctrl+C pour arrêter.\n")
+    print(f"[OK] Serveur démarré sur {HOST}:{PORT} (max {MAX_CLIENTS} clients)")
 
     global connexions_actives
 
@@ -231,18 +189,15 @@ def demarrer_serveur():
             try:
                 conn, adresse = srv.accept()
             except OSError:
-                break   # serveur arrêté
+                break
 
             with verrou_connexions:
                 if connexions_actives >= MAX_CLIENTS:
-                    # Refuser poliment
                     envoyer(conn, {
                         "statut":  "ERREUR",
-                        "message": "Serveur complet (20 clients max). "
-                                   "Réessayez plus tard."
+                        "message": "Serveur complet (20 clients max). Réessayez plus tard."
                     })
                     conn.close()
-                    print(f"[!] Connexion refusée (limite atteinte) : {adresse}")
                     continue
                 connexions_actives += 1
 
@@ -257,7 +212,7 @@ def demarrer_serveur():
         print("\n[..] Arrêt du serveur.")
     finally:
         srv.close()
-        print("[OK] Serveur fermé.")
 
 
-demarrer_serveur()
+if __name__ == "__main__":
+    demarrer_serveur()
