@@ -17,7 +17,16 @@ from peewee import (
 
 # ── Base de données ──────────────────────────────────────────────────────────
 
-db = SqliteDatabase("kiosk.db", pragmas={"foreign_keys": 1})
+db = SqliteDatabase(
+    "kiosk.db",
+    pragmas={
+        "foreign_keys": 1,
+        "journal_mode": "wal",   # autorise lecteurs + 1 writer en parallèle
+        "busy_timeout": 5000,    # attend jusqu'à 5s si la base est verrouillée
+                                 # au lieu de planter immédiatement avec "database is locked"
+    },
+    check_same_thread=False,
+)
 
 
 class BaseModel(Model):

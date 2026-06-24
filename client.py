@@ -9,28 +9,132 @@
 import socket
 import json
 import sys
+import time
 
-HOST = "127.0.0.1"
-PORT = 5555
+HOST = "thomas.proxy.rlwy.net"
+PORT = 46147
 BUFFER_SIZE = 4096
+MAX_TENTATIVES_RECONNEXION = 5
+DELAI_RECONNEXION = 2  # secondes entre chaque tentative
 
 
-# ── Protocole JSON ────────────────────────────────────────────────────────────
-
-def envoyer(sock, action: str, données: dict = {}):
-    requete = json.dumps({"action": action, "données": données},
-                         ensure_ascii=False) + "\n"
-    sock.sendall(requete.encode("utf-8"))
+class ConnexionPerdue(Exception):
+    """Levée quand la connexion ne peut pas être rétablie après plusieurs essais."""
+    pass
 
 
-def recevoir(sock) -> dict:
+def se_connecter(host: str, port: int, silencieux: bool = False) -> socket.socket:
+    """Ouvre une nouvelle connexion TCP avec keepalive activé."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+    if hasattr(socket, "TCP_KEEPCNT"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    sock.connect((host, port))
+    if not silencieux:
+        print(f"  ✓ Connecté à {host}:{port}")
+    return sock
+
+
+def _recevoir_sur_socket(sock) -> dict:
+    """Lit un message JSON directement sur une socket brute (utilisé pendant la reconnexion)."""
     data = b""
     while not data.endswith(b"\n"):
         chunk = sock.recv(BUFFER_SIZE)
         if not chunk:
-            return {}
+            raise ConnectionResetError("Connexion fermée par le serveur.")
         data += chunk
     return json.loads(data.decode("utf-8").strip())
+
+
+def reconnecter(host: str, port: int) -> socket.socket:
+    """Tente de rétablir la connexion plusieurs fois avant d'abandonner."""
+    for tentative in range(1, MAX_TENTATIVES_RECONNEXION + 1):
+        print(f"  ⟳ Reconnexion en cours… (tentative {tentative}/{MAX_TENTATIVES_RECONNEXION})")
+        try:
+            sock = se_connecter(host, port, silencieux=True)
+            _recevoir_sur_socket(sock)  # consomme le message de bienvenue
+            print("  ✓ Reconnecté avec succès.")
+            return sock
+        except (ConnectionRefusedError, OSError, ConnectionResetError):
+            time.sleep(DELAI_RECONNEXION)
+    raise ConnexionPerdue("Impossible de rétablir la connexion après plusieurs tentatives.")
+
+
+class Connexion:
+    """
+    Encapsule la socket TCP et gère la reconnexion automatique en cas de
+    coupure (ex: proxy Railway qui ferme une connexion inactive).
+    Toute requête échouée déclenche une tentative de reconnexion puis
+    un nouvel essai avant d'abandonner.
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.sock = se_connecter(host, port)
+
+    def _reconnecter(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.sock = reconnecter(self.host, self.port)
+
+    def envoyer(self, action: str, données: dict = {}) -> bool:
+        """Envoie une requête. Retourne False si même après reconnexion ça échoue."""
+        requete = json.dumps({"action": action, "données": données},
+                             ensure_ascii=False) + "\n"
+        try:
+            self.sock.sendall(requete.encode("utf-8"))
+            return True
+        except (BrokenPipeError, OSError, ConnectionResetError):
+            print("  ⚠ Connexion perdue. Tentative de reconnexion…")
+            try:
+                self._reconnecter()
+                self.sock.sendall(requete.encode("utf-8"))
+                return True
+            except (ConnexionPerdue, OSError):
+                print("  ✗ Reconnexion impossible. Vérifiez votre réseau.")
+                return False
+
+    def recevoir(self) -> dict:
+        """Reçoit une réponse. Tente une reconnexion si la connexion est morte."""
+        try:
+            return self._recevoir_brut()
+        except (ConnectionResetError, OSError, json.JSONDecodeError):
+            print("  ⚠ Connexion perdue en attendant la réponse. Reconnexion…")
+            try:
+                self._reconnecter()
+                return {"statut": "ERREUR",
+                        "message": ("La connexion a été rétablie, mais la dernière "
+                                    "action n'a peut-être pas été prise en compte. "
+                                    "Vérifiez votre profil/commande puis réessayez.")}
+            except ConnexionPerdue:
+                print("  ✗ Reconnexion impossible. Vérifiez votre réseau.")
+                return {"statut": "ERREUR", "message": "Connexion au serveur perdue."}
+
+    def _recevoir_brut(self) -> dict:
+        return _recevoir_sur_socket(self.sock)
+
+    def fermer(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ── Protocole JSON (compatibilité, utilisé par les fonctions flux_*) ─────────
+
+def envoyer(conn: "Connexion", action: str, données: dict = {}):
+    conn.envoyer(action, données)
+
+
+def recevoir(conn: "Connexion") -> dict:
+    return conn.recevoir()
 
 
 # ── Affichage helpers ─────────────────────────────────────────────────────────
@@ -76,32 +180,32 @@ def menu_principal(connecte: bool) -> list:
 
 # ── Flux non connecté ─────────────────────────────────────────────────────────
 
-def flux_inscription(sock):
+def flux_inscription(conn):
     print("\n── INSCRIPTION ──")
     identifiant = input("  Identifiant : ").strip()
     nom         = input("  Nom         : ").strip()
     prenom      = input("  Prénom      : ").strip()
     mdp         = input("  Mot de passe: ").strip()
-    envoyer(sock, "INSCRIPTION", {
+    conn.envoyer("INSCRIPTION", {
         "identifiant": identifiant, "nom": nom,
         "prenom": prenom, "mot_de_passe": mdp
     })
-    return recevoir(sock)
+    return conn.recevoir()
 
 
-def flux_connexion(sock):
+def flux_connexion(conn):
     print("\n── CONNEXION ──")
     identifiant = input("  Identifiant : ").strip()
     mdp         = input("  Mot de passe: ").strip()
-    envoyer(sock, "CONNEXION", {
+    conn.envoyer("CONNEXION", {
         "identifiant": identifiant, "mot_de_passe": mdp
     })
-    return recevoir(sock)
+    return conn.recevoir()
 
 
 # ── Flux connecté ─────────────────────────────────────────────────────────────
 
-def flux_commander(sock, token):
+def flux_commander(conn, token):
     print("\n── PASSER UNE COMMANDE ──")
     print("  Entrez les articles (format: ID QUANTITE), ligne vide pour terminer.")
     articles = []
@@ -118,38 +222,38 @@ def flux_commander(sock, token):
     if not articles:
         print("  Aucun article saisi.")
         return {}
-    envoyer(sock, "COMMANDER", {"token": token, "articles": articles})
-    return recevoir(sock)
+    conn.envoyer("COMMANDER", {"token": token, "articles": articles})
+    return conn.recevoir()
 
 
-def flux_annuler(sock, token):
+def flux_annuler(conn, token):
     print("\n── ANNULER UNE COMMANDE ──")
     cid = input("  Numéro de commande : ").strip()
     if not cid.isdigit():
         print("  Numéro invalide.")
         return {}
-    envoyer(sock, "ANNULER", {"token": token, "commande_id": int(cid)})
-    return recevoir(sock)
+    conn.envoyer("ANNULER", {"token": token, "commande_id": int(cid)})
+    return conn.recevoir()
 
 
-def flux_modifier_mdp(sock, token):
+def flux_modifier_mdp(conn, token):
     print("\n── MODIFIER MOT DE PASSE ──")
     ancien  = input("  Ancien mot de passe : ").strip()
     nouveau = input("  Nouveau mot de passe : ").strip()
-    envoyer(sock, "MODIFIER_MDP", {
+    conn.envoyer("MODIFIER_MDP", {
         "token": token, "ancien_mdp": ancien, "nouveau_mdp": nouveau
     })
-    return recevoir(sock)
+    return conn.recevoir()
 
 
-def flux_supprimer(sock, token):
+def flux_supprimer(conn, token):
     print("\n── SUPPRIMER MON PROFIL ──")
     confirm = input("  ⚠️  Cette action est irréversible. "
                     "Confirmez avec votre mot de passe : ").strip()
-    envoyer(sock, "SUPPRIMER_PROFIL", {
+    conn.envoyer("SUPPRIMER_PROFIL", {
         "token": token, "mot_de_passe": confirm
     })
-    return recevoir(sock)
+    return conn.recevoir()
 
 
 # ── Boucle principale ─────────────────────────────────────────────────────────
@@ -160,14 +264,13 @@ def main():
 
     print(f"Connexion au serveur {host}:{port}…")
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((host, port))
-    except ConnectionRefusedError:
+        conn = Connexion(host, port)
+    except (ConnectionRefusedError, OSError):
         print("Impossible de se connecter au serveur. Est-il démarré ?")
         sys.exit(1)
 
     # Message de bienvenue
-    rep = recevoir(sock)
+    rep = conn.recevoir()
     afficher_reponse(rep)
 
     token     = None
@@ -180,11 +283,11 @@ def main():
             # ── Non connecté ──────────────────────────────────────────────────
             if not connecte:
                 if choix == "1":
-                    rep = flux_inscription(sock)
+                    rep = flux_inscription(conn)
                     afficher_reponse(rep)
 
                 elif choix == "2":
-                    rep = flux_connexion(sock)
+                    rep = flux_connexion(conn)
                     afficher_reponse(rep)
                     if rep.get("statut") == "OK":
                         token    = rep["token"]
@@ -199,41 +302,41 @@ def main():
             # ── Connecté ──────────────────────────────────────────────────────
             else:
                 if choix == "1":
-                    envoyer(sock, "CATALOGUE", {"token": token})
-                    rep = recevoir(sock)
+                    conn.envoyer("CATALOGUE", {"token": token})
+                    rep = conn.recevoir()
                     afficher_reponse(rep)
 
                 elif choix == "2":
                     # Afficher le catalogue d'abord
-                    envoyer(sock, "CATALOGUE", {"token": token})
-                    rep = recevoir(sock)
+                    conn.envoyer("CATALOGUE", {"token": token})
+                    rep = conn.recevoir()
                     afficher_reponse(rep)
-                    rep = flux_commander(sock, token)
+                    rep = flux_commander(conn, token)
                     afficher_reponse(rep)
 
                 elif choix == "3":
-                    rep = flux_annuler(sock, token)
+                    rep = flux_annuler(conn, token)
                     afficher_reponse(rep)
 
                 elif choix == "4":
-                    envoyer(sock, "PROFIL", {"token": token})
-                    rep = recevoir(sock)
+                    conn.envoyer("PROFIL", {"token": token})
+                    rep = conn.recevoir()
                     afficher_reponse(rep)
 
                 elif choix == "5":
-                    rep = flux_modifier_mdp(sock, token)
+                    rep = flux_modifier_mdp(conn, token)
                     afficher_reponse(rep)
 
                 elif choix == "6":
-                    rep = flux_supprimer(sock, token)
+                    rep = flux_supprimer(conn, token)
                     afficher_reponse(rep)
                     if rep.get("statut") == "OK":
                         token    = None
                         connecte = False
 
                 elif choix == "0":
-                    envoyer(sock, "DECONNEXION", {"token": token})
-                    rep = recevoir(sock)
+                    conn.envoyer("DECONNEXION", {"token": token})
+                    rep = conn.recevoir()
                     afficher_reponse(rep)
                     token    = None
                     connecte = False
@@ -244,7 +347,7 @@ def main():
     except KeyboardInterrupt:
         print("\n  Interruption.")
     finally:
-        sock.close()
+        conn.fermer()
 
 
 main()

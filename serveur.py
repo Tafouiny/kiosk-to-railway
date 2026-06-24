@@ -8,6 +8,7 @@ import threading
 import json
 import time
 import os
+import traceback
 from datetime import datetime
 
 from models import init_db, Commande, db
@@ -40,14 +41,36 @@ BIENVENUE = r"""
 Connectez-vous ou créez un compte pour commencer.
 """
 
+# ── TCP Keepalive (évite les connexions "zombies" coupées par les proxys) ────
+
+def activer_keepalive(conn: socket.socket):
+    """
+    Active le TCP keepalive natif du système pour détecter rapidement
+    les connexions mortes (coupées par un proxy/NAT intermédiaire, ex. Railway)
+    au lieu de rester bloqué indéfiniment sur recv().
+    """
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except OSError:
+        pass
+
+
 # ── Protocole JSON ────────────────────────────────────────────────────────────
 
-def envoyer(conn: socket.socket, data: dict):
+def envoyer(conn: socket.socket, data: dict) -> bool:
+    """Envoie un message JSON. Retourne False si la connexion est morte."""
     try:
         message = json.dumps(data, ensure_ascii=False) + "\n"
         conn.sendall(message.encode("utf-8"))
+        return True
     except (BrokenPipeError, OSError):
-        pass
+        return False
 
 
 def recevoir(conn: socket.socket) -> dict | None:
@@ -80,6 +103,8 @@ def lancer_timer_validation(commande_id: int):
 def traiter_action(action: str, données: dict) -> dict:
     token = données.get("token", "")
 
+    if action == "PING":
+        return {"statut": "OK", "message": "PONG"}
     if action == "INSCRIPTION":
         return inscrire_client(
             données.get("identifiant", ""),
@@ -123,10 +148,11 @@ def gerer_client(conn: socket.socket, adresse: tuple):
     global connexions_actives
 
     ip, port = adresse
+    activer_keepalive(conn)
     db.connect(reuse_if_open=True)
     print(f"[+] Nouveau client : {ip}:{port} (actifs: {connexions_actives})")
 
-    envoyer(conn, {
+    if not envoyer(conn, {
         "statut":  "BIENVENUE",
         "message": BIENVENUE,
         "actions": [
@@ -134,7 +160,9 @@ def gerer_client(conn: socket.socket, adresse: tuple):
             "PROFIL", "MODIFIER_MDP", "SUPPRIMER_PROFIL",
             "CATALOGUE", "COMMANDER", "ANNULER",
         ]
-    })
+    }):
+        print(f"[!] Impossible d'envoyer le message de bienvenue à {ip}:{port} "
+              f"(connexion déjà fermée)")
 
     try:
         while True:
@@ -145,21 +173,26 @@ def gerer_client(conn: socket.socket, adresse: tuple):
 
             action  = requete.get("action", "").upper()
             données = requete.get("données", {})
-            print(f"[>] {ip}:{port}  action={action}")
+            if action != "PING":
+                print(f"[>] {ip}:{port}  action={action}")
 
             try:
                 réponse = traiter_action(action, données)
             except Exception as e:
-                print(f"[!] Erreur {action} : {e}")
+                print(f"[!] Erreur {action} chez {ip}:{port} : {e}")
+                traceback.print_exc()
                 réponse = {"statut": "ERREUR", "message": f"Erreur serveur : {e}"}
 
-            envoyer(conn, réponse)
+            if not envoyer(conn, réponse):
+                print(f"[-] Connexion perdue en répondant à {ip}:{port}")
+                break
 
             if action == "DECONNEXION" and réponse.get("statut") == "OK":
                 break
 
     except Exception as e:
-        print(f"[!] Erreur client {ip}:{port} : {e}")
+        print(f"[!] Erreur inattendue client {ip}:{port} : {e}")
+        traceback.print_exc()
     finally:
         conn.close()
         if not db.is_closed():
@@ -188,28 +221,38 @@ def demarrer_serveur():
         while True:
             try:
                 conn, adresse = srv.accept()
-            except OSError:
+            except OSError as e:
+                print(f"[!] Erreur sur accept() : {e}")
+                traceback.print_exc()
                 break
 
-            with verrou_connexions:
-                if connexions_actives >= MAX_CLIENTS:
-                    envoyer(conn, {
-                        "statut":  "ERREUR",
-                        "message": "Serveur complet (20 clients max). Réessayez plus tard."
-                    })
-                    conn.close()
-                    continue
-                connexions_actives += 1
+            try:
+                with verrou_connexions:
+                    if connexions_actives >= MAX_CLIENTS:
+                        envoyer(conn, {
+                            "statut":  "ERREUR",
+                            "message": "Serveur complet (20 clients max). Réessayez plus tard."
+                        })
+                        conn.close()
+                        continue
+                    connexions_actives += 1
 
-            t = threading.Thread(
-                target=gerer_client,
-                args=(conn, adresse),
-                daemon=True
-            )
-            t.start()
+                t = threading.Thread(
+                    target=gerer_client,
+                    args=(conn, adresse),
+                    daemon=True
+                )
+                t.start()
+            except Exception as e:
+                # Ne jamais laisser une erreur sur UNE connexion tuer la boucle d'accept
+                print(f"[!] Erreur en démarrant le thread client : {e}")
+                traceback.print_exc()
 
     except KeyboardInterrupt:
         print("\n[..] Arrêt du serveur.")
+    except Exception as e:
+        print(f"[!!!] Erreur fatale dans la boucle principale : {e}")
+        traceback.print_exc()
     finally:
         srv.close()
 
